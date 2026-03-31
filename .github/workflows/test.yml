@@ -1,0 +1,99 @@
+# FILE: .github/workflows/test.yml
+# This workflow TESTS the action itself — it runs in the validate-urdf-action repo.
+# Every push to main or PR runs these tests to confirm the action works correctly.
+# Place this file at: .github/workflows/test.yml in the validate-urdf-action repo.
+
+name: Test Action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-valid-urdf:
+    name: Test — Valid URDF passes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Create a minimal valid URDF for testing
+      - name: Create test URDF
+        run: |
+          cat > /tmp/test_valid.urdf << 'EOF'
+          <?xml version="1.0"?>
+          <robot name="test_arm">
+            <link name="base_link"/>
+            <link name="link_1"/>
+            <link name="tool0"/>
+            <joint name="joint_1" type="revolute">
+              <parent link="base_link"/>
+              <child link="link_1"/>
+              <axis xyz="0 0 1"/>
+              <limit effort="100" velocity="1.0" lower="-3.14" upper="3.14"/>
+            </joint>
+            <joint name="tool_joint" type="fixed">
+              <parent link="link_1"/>
+              <child link="tool0"/>
+            </joint>
+          </robot>
+          EOF
+
+      # Run the action against the valid URDF — must succeed
+      - name: Validate valid URDF
+        uses: ./
+        with:
+          api-key: ${{ secrets.ROBOINFRA_API_KEY }}
+          file: /tmp/test_valid.urdf
+
+  test-invalid-urdf-report-mode:
+    name: Test — Invalid URDF in report mode does not fail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Create an invalid URDF
+      - name: Create invalid test URDF
+        run: echo "<bad_root>not a robot</bad_root>" > /tmp/test_invalid.urdf
+
+      # Run the action with fail-on-invalid=false — must NOT fail the job
+      - name: Validate invalid URDF (report only)
+        id: check
+        uses: ./
+        with:
+          api-key: ${{ secrets.ROBOINFRA_API_KEY }}
+          file: /tmp/test_invalid.urdf
+          fail-on-invalid: false
+
+      # Confirm the output says is-valid=false
+      - name: Assert is-valid output is false
+        run: |
+          if [ "${{ steps.check.outputs.is-valid }}" != "false" ]; then
+            echo "Expected is-valid=false for invalid URDF"
+            exit 1
+          fi
+          echo "Correctly reported is-valid=false"
+
+  test-missing-file-fails:
+    name: Test — Missing file causes clear error
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate non-existent file (must fail)
+        id: check
+        uses: ./
+        with:
+          api-key: ${{ secrets.ROBOINFRA_API_KEY }}
+          file: does-not-exist.urdf
+        continue-on-error: true
+
+      - name: Confirm it failed
+        run: |
+          if [ "${{ steps.check.outcome }}" == "success" ]; then
+            echo "Expected failure for missing file — but step succeeded"
+            exit 1
+          fi
+          echo "Correctly failed for missing file"

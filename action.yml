@@ -1,0 +1,150 @@
+# FILE: action.yml
+# This is the heart of the GitHub Action.
+# It defines what inputs the action accepts, what it runs, and what it outputs.
+# Place this file in the ROOT of your validate-urdf-action repository.
+
+name: 'RoboInfra URDF Validator'
+description: 'Validate ROS URDF files using the RoboInfra API. Fails CI if URDF has structural errors.'
+author: 'RoboInfra'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'Your RoboInfra API key (starts with rk_). Store this as a GitHub secret.'
+    required: true
+
+  file:
+    description: 'Path to the URDF file to validate, relative to the repo root. Example: urdf/robot.urdf'
+    required: true
+
+  fail-on-invalid:
+    description: 'Set to false to allow the workflow to continue even if URDF is invalid (prints errors but does not fail).'
+    required: false
+    default: 'true'
+
+  analyze:
+    description: 'Also run kinematic analysis (requires Basic or Pro plan). Returns DOF, end effectors, joint chain.'
+    required: false
+    default: 'false'
+
+outputs:
+  is-valid:
+    description: 'true if the URDF passed all 9 structural checks, false otherwise.'
+    value: ${{ steps.validate.outputs.is_valid }}
+
+  errors:
+    description: 'Comma-separated list of validation errors. Empty string if valid.'
+    value: ${{ steps.validate.outputs.errors }}
+
+  dof:
+    description: 'Degrees of freedom (only set when analyze=true and plan allows it).'
+    value: ${{ steps.validate.outputs.dof }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install roboinfra-sdk
+      shell: bash
+      run: pip install roboinfra-sdk --quiet
+
+    - name: Validate URDF
+      id: validate
+      shell: python
+      env:
+        ROBOINFRA_API_KEY: ${{ inputs.api-key }}
+        URDF_FILE: ${{ inputs.file }}
+        FAIL_ON_INVALID: ${{ inputs.fail-on-invalid }}
+        RUN_ANALYZE: ${{ inputs.analyze }}
+      run: |
+        import os
+        import sys
+
+        api_key       = os.environ["ROBOINFRA_API_KEY"]
+        urdf_file     = os.environ["URDF_FILE"]
+        fail_on_invalid = os.environ.get("FAIL_ON_INVALID", "true").lower() == "true"
+        run_analyze   = os.environ.get("RUN_ANALYZE", "false").lower() == "true"
+
+        github_output = os.environ.get("GITHUB_OUTPUT", "")
+
+        import roboinfra as roboinfra
+        from roboinfra import AuthError, PlanError, QuotaError, RoboInfraError
+
+        #  Validate file exists ─
+        if not os.path.isfile(urdf_file):
+            print(f"::error::URDF file not found: {urdf_file}")
+            print(f"::error::Make sure the path is relative to the repository root.")
+            sys.exit(1)
+
+        client = roboinfra.Client(api_key)
+
+        #  Run validation ─
+        print(f"::group::RoboInfra URDF Validation")
+        print(f"  File    : {urdf_file}")
+        print(f"  Analyze : {run_analyze}")
+
+        try:
+            result = client.urdf.validate(urdf_file)
+        except AuthError:
+            print("::error::Invalid or revoked API key. Check your ROBOINFRA_API_KEY secret.")
+            print("::endgroup::")
+            sys.exit(1)
+        except QuotaError:
+            print("::error::Monthly quota exceeded. Upgrade your plan at https://roboinfra-dashboard.azurewebsites.net/subscription")
+            print("::endgroup::")
+            sys.exit(1)
+        except RoboInfraError as e:
+            print(f"::error::RoboInfra API error: {e}")
+            print("::endgroup::")
+            sys.exit(1)
+
+        #  Write validation outputs ─
+        errors_joined = ",".join(result.errors) if result.errors else ""
+
+        if github_output:
+            with open(github_output, "a") as f:
+                f.write(f"is_valid={'true' if result.is_valid else 'false'}\n")
+                f.write(f"errors={errors_joined}\n")
+
+        if result.is_valid:
+            print(f"  Result  : ✓ VALID — all 9 structural checks passed")
+        else:
+            print(f"  Result  : ✗ INVALID — {len(result.errors)} error(s) found")
+            for i, err in enumerate(result.errors, 1):
+                print(f"    {i}. {err}")
+                print(f"::error file={urdf_file}::{err}")
+
+        #  Run kinematic analysis (optional) 
+        dof = ""
+        if run_analyze and result.is_valid:
+            try:
+                analysis = client.urdf.analyze(urdf_file)
+                dof = str(analysis.dof)
+                print(f"  Robot   : {analysis.robot_name}")
+                print(f"  DOF     : {analysis.dof}")
+                print(f"  Links   : {analysis.link_count}")
+                print(f"  Joints  : {analysis.joint_count}")
+                print(f"  End effectors: {', '.join(analysis.end_effectors)}")
+            except PlanError:
+                print("::warning::Kinematic analysis requires Basic or Pro plan. Skipping.")
+            except RoboInfraError as e:
+                print(f"::warning::Analysis failed: {e}")
+
+        if github_output:
+            with open(github_output, "a") as f:
+                f.write(f"dof={dof}\n")
+
+        print("::endgroup::")
+
+        #  Exit code 
+        if not result.is_valid and fail_on_invalid:
+            print()
+            print("URDF validation failed. Fix the errors above before merging.")
+            sys.exit(1)
