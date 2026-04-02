@@ -1,7 +1,35 @@
 # FILE: action.yml
-# This is the heart of the GitHub Action.
-# It defines what inputs the action accepts, what it runs, and what it outputs.
 # Place this file in the ROOT of your validate-urdf-action repository.
+#
+# BUG FIX: "Test  Invalid URDF in report mode does not fail" was failing
+#
+# ROOT CAUSE (two layers):
+#
+#   Layer 1  SDK (client.py):
+#     _handle_response() raises RoboInfraError("Bad request: ...") for ALL HTTP 400
+#     responses. But for /api/urdf/validate, HTTP 400 means "URDF is structurally
+#     invalid"  it's a validation result, not an API error.
+#     The API returns: { "data": { "isValid": false, "errors": [...] } }
+#
+#   Layer 2  This action.yml:
+#     The except RoboInfraError block always called sys.exit(1), so even with
+#     fail-on-invalid=false the action crashed before reaching the
+#     "if not result.is_valid and fail_on_invalid" check.
+#
+# THE FIX (both layers):
+#
+#   urdf.py (SDK) is the proper fix  validate() now catches RoboInfraError(400),
+#   parses the response body, and returns ValidationResult(is_valid=False).
+#
+#   This action.yml also contains a defense-in-depth fix in the except block:
+#   If the SDK raises RoboInfraError with status_code=400, we parse the response
+#   body ourselves and build a result object. This handles the case where an older
+#   SDK version (without the urdf.py fix) is installed.
+#
+# NODE.JS 20 WARNING:
+#   "Node.js 20 actions are deprecated"  this is a GitHub deprecation notice,
+#   NOT a bug. It will become a breaking change in June 2026. Fixed in test.yml
+#   by adding FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true to the workflow env.
 
 name: 'RoboInfra URDF Validator'
 description: 'Validate ROS URDF files using the RoboInfra API. Fails CI if URDF has structural errors.'
@@ -66,18 +94,18 @@ runs:
       run: |
         import os
         import sys
+        import json as _json
 
-        api_key       = os.environ["ROBOINFRA_API_KEY"]
-        urdf_file     = os.environ["URDF_FILE"]
+        api_key         = os.environ["ROBOINFRA_API_KEY"]
+        urdf_file       = os.environ["URDF_FILE"]
         fail_on_invalid = os.environ.get("FAIL_ON_INVALID", "true").lower() == "true"
-        run_analyze   = os.environ.get("RUN_ANALYZE", "false").lower() == "true"
-
-        github_output = os.environ.get("GITHUB_OUTPUT", "")
+        run_analyze     = os.environ.get("RUN_ANALYZE", "false").lower() == "true"
+        github_output   = os.environ.get("GITHUB_OUTPUT", "")
 
         import roboinfra as roboinfra
         from roboinfra import AuthError, PlanError, QuotaError, RoboInfraError
 
-        #  Validate file exists ─
+        # ── Validate file exists ─────────────────────────────────────────────
         if not os.path.isfile(urdf_file):
             print(f"::error::URDF file not found: {urdf_file}")
             print(f"::error::Make sure the path is relative to the repository root.")
@@ -85,27 +113,74 @@ runs:
 
         client = roboinfra.Client(api_key)
 
-        #  Run validation ─
+        # ── Run validation ───────────────────────────────────────────────────
         print(f"::group::RoboInfra URDF Validation")
         print(f"  File    : {urdf_file}")
         print(f"  Analyze : {run_analyze}")
 
+        result = None
+
         try:
             result = client.urdf.validate(urdf_file)
+
         except AuthError:
+            # 401  wrong API key. Always fatal regardless of fail-on-invalid.
             print("::error::Invalid or revoked API key. Check your ROBOINFRA_API_KEY secret.")
             print("::endgroup::")
             sys.exit(1)
+
         except QuotaError:
+            # 429  quota exhausted. Always fatal.
             print("::error::Monthly quota exceeded. Upgrade your plan at https://roboinfra-dashboard.azurewebsites.net/subscription")
             print("::endgroup::")
             sys.exit(1)
-        except RoboInfraError as e:
-            print(f"::error::RoboInfra API error: {e}")
-            print("::endgroup::")
-            sys.exit(1)
 
-        #  Write validation outputs ─
+        except RoboInfraError as e:
+            # ── BUG FIX ───────────────────────────────────────────────────────
+            # HTTP 400 from /api/urdf/validate means the URDF is structurally invalid.
+            # Older SDK versions (without the urdf.py fix) raise RoboInfraError(400)
+            # instead of returning ValidationResult(is_valid=False).
+            #
+            # We parse the response body here so fail-on-invalid=false works correctly.
+            #
+            # BEFORE this fix: sys.exit(1) was called here unconditionally 
+            #   the action always failed, even with fail-on-invalid=false.
+            #
+            # AFTER this fix: 400 responses are parsed into a result object so
+            #   the normal "if not result.is_valid and fail_on_invalid" check runs.
+            if e.status_code == 400 and e.response_body:
+                try:
+                    body = _json.loads(e.response_body)
+                    data = body.get("data", {})
+
+                    # Build a result-like object from parsed API response
+                    class _Result:
+                        pass
+                    result = _Result()
+                    result.is_valid = data.get("isValid", False)
+
+                    raw_errors = data.get("errors")
+                    if raw_errors:
+                        # data.errors is a list of strings
+                        result.errors = raw_errors
+                    else:
+                        # Fallback: split the message field on "|"
+                        # API format: "Root element must be <robot> | At least one <link> must exist"
+                        msg = body.get("message", str(e))
+                        result.errors = [part.strip() for part in msg.split("|") if part.strip()]
+
+                except (_json.JSONDecodeError, Exception):
+                    # Body was not parseable JSON  treat as a real error
+                    print(f"::error::RoboInfra API error: {e}")
+                    print("::endgroup::")
+                    sys.exit(1)
+            else:
+                # Any other error (5xx server error, network failure, etc.)  always fatal
+                print(f"::error::RoboInfra API error: {e}")
+                print("::endgroup::")
+                sys.exit(1)
+
+        # ── Write validation outputs ─────────────────────────────────────────
         errors_joined = ",".join(result.errors) if result.errors else ""
 
         if github_output:
@@ -114,14 +189,14 @@ runs:
                 f.write(f"errors={errors_joined}\n")
 
         if result.is_valid:
-            print(f"  Result  : ✓ VALID — all 9 structural checks passed")
+            print(f"  Result  : v VALID  all 9 structural checks passed")
         else:
-            print(f"  Result  : ✗ INVALID — {len(result.errors)} error(s) found")
+            print(f"  Result  : x INVALID  {len(result.errors)} error(s) found")
             for i, err in enumerate(result.errors, 1):
                 print(f"    {i}. {err}")
                 print(f"::error file={urdf_file}::{err}")
 
-        #  Run kinematic analysis (optional) 
+        # ── Run kinematic analysis (optional) ────────────────────────────────
         dof = ""
         if run_analyze and result.is_valid:
             try:
@@ -143,7 +218,13 @@ runs:
 
         print("::endgroup::")
 
-        #  Exit code 
+        # ── Exit code ────────────────────────────────────────────────────────
+        # Only fail when BOTH conditions are true:
+        #   1. URDF is invalid (result.is_valid = False)
+        #   2. fail-on-invalid is true (default)
+        #
+        # With fail-on-invalid=false: prints errors, writes outputs, exits 0.
+        # This is what the report-only test tests.
         if not result.is_valid and fail_on_invalid:
             print()
             print("URDF validation failed. Fix the errors above before merging.")
