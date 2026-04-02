@@ -1,35 +1,13 @@
 # FILE: .github/workflows/test.yml
-# Self-tests for the validate-urdf-action.
+# Self-tests for validate-urdf-action.
 # Runs on every push to main and every pull request.
-#
-# FIXES IN THIS VERSION:
-#
-#   FIX 1  Node.js 20 deprecation warning resolved:
-#     BEFORE: "Node.js 20 actions are deprecated" warning on every run.
-#     CAUSE:  actions/checkout@v4 and actions/setup-python@v5 internally
-#             compile their runner code with Node.js 20. GitHub is deprecating
-#             Node 20 runners and will force Node 24 from June 2, 2026.
-#     FIX:    Added env: FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true at workflow
-#             level. This opts into Node 24 now, eliminating the warning.
-#     NOTE:   This is a warning, NOT a bug  it was not causing the test failure.
-#
-#   FIX 2  "Invalid URDF in report mode" test now passes:
-#     BEFORE: action.yml's except RoboInfraError block always called sys.exit(1)
-#             regardless of fail-on-invalid setting.
-#     CAUSE:  The SDK raised RoboInfraError("Bad request:...") for HTTP 400
-#             (invalid URDF) instead of returning ValidationResult(is_valid=False).
-#     FIX:    Both urdf.py (SDK) and action.yml (action) now handle 400 as a
-#             validation result, not a fatal error. See those files for details.
-#
-#   FIX 3  URDF heredoc indentation cleaned up:
-#     BEFORE: The heredoc lines had leading spaces from YAML block indentation.
-#             Some strict XML parsers reject whitespace before <?xml?>.
-#     FIX:    Heredoc content starts at column 0 using printf. Guaranteed clean.
 
 name: Test Action
 
-# Suppress Node.js 20 deprecation warning  opt into Node.js 24 now.
-# Remove this after actions/checkout and actions/setup-python ship Node 24 builds.
+# Fix Node.js 20 deprecation warning.
+# actions/checkout and actions/setup-python internally use Node.js 20.
+# This env variable opts into Node.js 24 now, eliminating the warning.
+# Safe to remove once those actions ship Node.js 24 builds natively.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -41,114 +19,129 @@ on:
 
 jobs:
 
-  # ── TEST 1: Valid URDF should pass ────────────────────────────────────────
+  # ── TEST 1: Valid URDF should pass and set is-valid=true ─────────────────
   test-valid-urdf:
-    name: Test  Valid URDF passes
+    name: Test — Valid URDF passes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Create valid test URDF
         run: |
-          printf '<?xml version="1.0"?>\n<robot name="test_arm">\n  <link name="base_link"/>\n  <link name="link_1"/>\n  <link name="tool0"/>\n  <joint name="joint_1" type="revolute">\n    <parent link="base_link"/>\n    <child link="link_1"/>\n    <axis xyz="0 0 1"/>\n    <limit effort="100" velocity="1.0" lower="-3.14" upper="3.14"/>\n  </joint>\n  <joint name="tool_joint" type="fixed">\n    <parent link="link_1"/>\n    <child link="tool0"/>\n  </joint>\n</robot>\n' > /tmp/test_valid.urdf
-          echo "Created URDF at /tmp/test_valid.urdf"
-          cat /tmp/test_valid.urdf
+          printf '%s\n' \
+            '<?xml version="1.0"?>' \
+            '<robot name="test_arm">' \
+            '  <link name="base_link"/>' \
+            '  <link name="link_1"/>' \
+            '  <link name="tool0"/>' \
+            '  <joint name="joint_1" type="revolute">' \
+            '    <parent link="base_link"/>' \
+            '    <child link="link_1"/>' \
+            '    <axis xyz="0 0 1"/>' \
+            '    <limit effort="100" velocity="1.0" lower="-3.14" upper="3.14"/>' \
+            '  </joint>' \
+            '  <joint name="tool_joint" type="fixed">' \
+            '    <parent link="link_1"/>' \
+            '    <child link="tool0"/>' \
+            '  </joint>' \
+            '</robot>' > /tmp/valid.urdf
+          echo "--- Created URDF ---"
+          cat /tmp/valid.urdf
 
       - name: Validate valid URDF
         id: check
         uses: ./
         with:
           api-key: ${{ secrets.ROBOINFRA_API_KEY }}
-          file: /tmp/test_valid.urdf
+          file: /tmp/valid.urdf
 
-      - name: Assert is-valid output is true
+      - name: Assert is-valid=true
         run: |
-          echo "is-valid output: '${{ steps.check.outputs.is-valid }}'"
+          echo "is-valid: '${{ steps.check.outputs.is-valid }}'"
           if [ "${{ steps.check.outputs.is-valid }}" != "true" ]; then
-            echo "FAIL: Expected is-valid=true for a valid URDF"
+            echo "FAIL: expected is-valid=true"
             exit 1
           fi
-          echo "PASS: is-valid=true as expected"
+          echo "PASS"
 
 
-  # ── TEST 2: Invalid URDF with fail-on-invalid=false should NOT fail ───────
-  # THIS WAS THE FAILING TEST.
-  # Root cause: SDK raised RoboInfraError for HTTP 400 (invalid URDF) instead of
-  # returning ValidationResult(is_valid=False). The action's except block then
-  # always called sys.exit(1) regardless of fail-on-invalid setting.
-  # Fix: Both urdf.py and action.yml now handle HTTP 400 as a validation result.
+  # ── TEST 2: Invalid URDF with fail-on-invalid=false must NOT fail the job ─
+  # This was the failing test. Root cause was confirmed:
+  #   API returns { "data": null, "message": "Err1 | Err2" } for invalid URDFs.
+  #   Python dict.get("data", {}) returns None (not {}) when key exists with null.
+  #   "isValid" in None raises TypeError, silently caught, re-raises RoboInfraError.
+  #   The action always exited 1, even with fail-on-invalid=false.
+  # Fix: removed SDK dependency. action.yml calls the API directly with requests.
+  #   data = body.get("data") or {}  correctly handles null.
   test-invalid-urdf-report-mode:
-    name: Test  Invalid URDF in report mode does not fail
+    name: Test — Invalid URDF in report mode does not fail
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Create invalid test URDF
-        run: |
-          printf '<bad_root>this is not a valid robot</bad_root>\n' > /tmp/test_invalid.urdf
-          echo "Created invalid URDF at /tmp/test_invalid.urdf"
-          cat /tmp/test_invalid.urdf
+        run: printf '<bad_root>not a robot</bad_root>\n' > /tmp/invalid.urdf
 
-      # fail-on-invalid=false  job must NOT fail even though URDF is invalid
-      - name: Validate invalid URDF (report only  must not fail)
+      # fail-on-invalid=false — the step must succeed (exit 0) even though URDF is invalid
+      - name: Validate invalid URDF with fail-on-invalid=false
         id: check
         uses: ./
         with:
           api-key: ${{ secrets.ROBOINFRA_API_KEY }}
-          file: /tmp/test_invalid.urdf
+          file: /tmp/invalid.urdf
           fail-on-invalid: 'false'
 
-      - name: Assert is-valid output is false
+      - name: Assert is-valid=false
         run: |
-          echo "is-valid output: '${{ steps.check.outputs.is-valid }}'"
+          echo "is-valid: '${{ steps.check.outputs.is-valid }}'"
           if [ "${{ steps.check.outputs.is-valid }}" != "false" ]; then
-            echo "FAIL: Expected is-valid=false for an invalid URDF"
+            echo "FAIL: expected is-valid=false for invalid URDF"
             exit 1
           fi
-          echo "PASS: is-valid=false as expected"
+          echo "PASS: is-valid correctly set to false"
 
-      - name: Assert errors output is not empty
+      - name: Assert errors output is populated
         run: |
-          echo "errors output: '${{ steps.check.outputs.errors }}'"
+          echo "errors: '${{ steps.check.outputs.errors }}'"
           if [ -z "${{ steps.check.outputs.errors }}" ]; then
-            echo "FAIL: Expected errors to be non-empty for invalid URDF"
+            echo "FAIL: errors output should not be empty for invalid URDF"
             exit 1
           fi
-          echo "PASS: errors are populated as expected"
+          echo "PASS: errors output is populated"
 
 
-  # ── TEST 3: Invalid URDF with fail-on-invalid=true (default) should fail ──
+  # ── TEST 3: Invalid URDF with default fail-on-invalid=true must fail ──────
   test-invalid-urdf-fails-by-default:
-    name: Test  Invalid URDF fails by default
+    name: Test — Invalid URDF fails by default
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Create invalid test URDF
-        run: printf '<bad_root>not a robot</bad_root>\n' > /tmp/test_invalid2.urdf
+        run: printf '<bad_root>not a robot</bad_root>\n' > /tmp/invalid2.urdf
 
-      - name: Validate invalid URDF (default fail-on-invalid=true)
+      - name: Validate invalid URDF (must fail — continue-on-error catches it)
         id: check
         uses: ./
         with:
           api-key: ${{ secrets.ROBOINFRA_API_KEY }}
-          file: /tmp/test_invalid2.urdf
+          file: /tmp/invalid2.urdf
           fail-on-invalid: 'true'
-        continue-on-error: true  # we expect this to fail  catch it
+        continue-on-error: true
 
-      - name: Assert the step failed
+      - name: Assert step outcome is failure
         run: |
-          echo "Step outcome: '${{ steps.check.outcome }}'"
-          if [ "${{ steps.check.outcome }}" == "success" ]; then
-            echo "FAIL: Expected the action to fail for an invalid URDF with fail-on-invalid=true"
+          echo "outcome: '${{ steps.check.outcome }}'"
+          if [ "${{ steps.check.outcome }}" != "failure" ]; then
+            echo "FAIL: expected the action to fail for invalid URDF with fail-on-invalid=true"
             exit 1
           fi
-          echo "PASS: action correctly failed for invalid URDF"
+          echo "PASS: action correctly failed"
 
 
-  # ── TEST 4: Missing file should fail with clear error ────────────────────
+  # ── TEST 4: Missing file must exit with clear error ───────────────────────
   test-missing-file-fails:
-    name: Test  Missing file causes clear error
+    name: Test — Missing file causes clear error
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -161,11 +154,11 @@ jobs:
           file: does-not-exist.urdf
         continue-on-error: true
 
-      - name: Assert the step failed
+      - name: Assert step outcome is failure
         run: |
-          echo "Step outcome: '${{ steps.check.outcome }}'"
-          if [ "${{ steps.check.outcome }}" == "success" ]; then
-            echo "FAIL: Expected failure for missing file  but step succeeded"
+          echo "outcome: '${{ steps.check.outcome }}'"
+          if [ "${{ steps.check.outcome }}" != "failure" ]; then
+            echo "FAIL: expected failure for missing file"
             exit 1
           fi
           echo "PASS: correctly failed for missing file"
